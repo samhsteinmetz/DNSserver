@@ -68,8 +68,16 @@ class Server:
         
         if res.rr:
             return res
-        
-        
+
+        # If we asked for NS records and the auth section has NS records for our qname,
+        # that IS the answer — don't recurse further
+        if qtype == QTYPE.NS:
+            for authRR in res.auth:
+                if authRR.rtype == QTYPE.NS and str(authRR.rname).lower() == qname.lower():
+                    # Move the NS records from auth into rr (answer) so the caller sees them
+                    res.rr = [rr for rr in res.auth if rr.rtype == QTYPE.NS and str(rr.rname).lower() == qname.lower()]
+                    return res
+
         for nsRR in res.auth:
             if nsRR.rtype == QTYPE.NS:
                 name = str(nsRR.rdata)
@@ -133,21 +141,34 @@ class Server:
         qname = str(request.q.qname).lower()
         qtype = request.q.qtype
         
-        if (qname, qtype) not in self.zone:
-            rep.header.rcode = RCODE.NXDOMAIN
-        else:
+        if (qname, qtype) in self.zone:
             records = self.zone[(qname, qtype)]
             for r in records:
                 rep.add_answer(r)
-                
-                
+
+
             if qtype == QTYPE.NS:
                 for ns_rr in records:
                     ns_name = str(ns_rr.rdata).lower()
-                    # look up a record in our zone file 
+                    # look up a record in our zone file
                     glue = self.zone.get((ns_name, QTYPE.A), [])
                     for glue_rr in glue:
                         rep.add_ar(glue_rr)
+        elif (qname, QTYPE.CNAME) in self.zone:
+            # CNAME chasing: return the CNAME record(s) and resolve the target if in our zone
+            cname_records = self.zone[(qname, QTYPE.CNAME)]
+            for cr in cname_records:
+                rep.add_answer(cr)
+                # if the client asked for A record but we get a CNAME resolve it 
+                if qtype == QTYPE.A:
+                    target = str(cr.rdata).lower()
+                    if target[-1] != '.':
+                        target += '.'
+                    a_records = self.zone.get((target, QTYPE.A), [])
+                    for ar in a_records:
+                        rep.add_answer(ar)
+        else:
+            rep.header.rcode = RCODE.NXDOMAIN
                 
         self.send(addr, rep)
 
