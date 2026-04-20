@@ -1,0 +1,239 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE
+
+
+
+
+class Server:
+    def __init__(self, root_ip, domain, port):
+        self.root_ip = root_ip
+        self.domain = domain
+        self.origin = None
+        
+        self.zone = {}
+        
+        
+        self.get_zone_file(domain)
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        #self.socket.bind(("0.0.0.0", port))
+        
+        #
+        self.socket.bind(("127.0.0.1", port))
+        self.port = self.socket.getsockname()[1]
+
+        self.log("Bound to port %d" % self.port)
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, addr, message):
+        self.log("Sending message:\n%s" % message)
+        self.socket.sendto(message.pack(), addr)
+        
+    #send question query
+    def send_query_DNS(self, dest_addr, qname, qtype):
+        
+        #build packet
+        question = DNSRecord.question(qname, qtype=QTYPE[qtype], )
+        
+        #send it to server
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        # s.bind((dest_addr, 60531))
+        s.settimeout(2)
+        s.sendto(question.pack(), (dest_addr, 60053))
+        
+        #wait and parse for responsess
+        
+        
+        data, addr = s.recvfrom(65535)
+        s.close()
+        return DNSRecord.parse(data)
+        
+        pass
+    
+    def recursive_lookup(self, qname, qtype, serverIP):
+        if serverIP is None:
+            serverIP = self.root_ip
+            
+            
+        res = self.send_query_DNS(serverIP, qname, qtype)
+        
+        if res is None:
+            return None
+        
+        if res.rr:
+            return res
+        
+        
+        for nsRR in res.auth:
+            if nsRR.rtype == QTYPE.NS:
+                name = str(nsRR.rdata)
+                
+                ip = None
+                for ip_sec in res.ar:
+                    if name.lower() == str(ip_sec.rname).lower():
+                        ip = str(ip_sec.rdata)
+                        break
+                
+                if ip is None:
+                    nsRecods = self.recursive_lookup(name,QTYPE.A,None)
+                    if nsRecods:
+                        ip = str(nsRecods.rr[0].rdata)
+                    
+                if ip:
+                    return self.recursive_lookup(qname,qtype,ip)
+        
+        # 
+        # 
+        # answer = self.send_query_DNS(serverIP, qname, qtype)
+        # if self.is_authoritive(answer.q.name):
+        #      self.authoritative_send(answer, serverIP)
+        # else:
+        #     #logic here
+        #     pass
+            
+        # return
+        return None
+            
+        
+        
+    def get_zone_file(self, zfile):
+        
+        with open(zfile) as zf:
+            text = zf.read()
+            
+        
+        for r in RR.fromZone(text):
+            name = str(r.rname)
+            name = name.lower()
+            # check if it exists in zone dict already
+            if (name, r.rtype) in self.zone:
+                self.zone[(name, r.rtype)].append(r)
+            else:
+                self.zone[(name, r.rtype)] = [r]
+                
+            if self.origin is None and r.rtype == QTYPE.SOA:
+                self.origin = name
+                self.log("============setting authoritative server ===========:\n=========:: %s ::========" % name)
+                    
+            
+        return
+    
+    def authoritative_send(self, request, addr):
+        rep = request.reply()
+        rep.header.aa = 1
+        
+        
+        # get the question name from the question section in the packet and get the type
+        qname = str(request.q.qname).lower()
+        qtype = request.q.qtype
+        
+        if (qname, qtype) not in self.zone:
+            rep.header.rcode = RCODE.NXDOMAIN
+        else:
+            records = self.zone[(qname, qtype)]
+            for r in records:
+                rep.add_answer(r)
+                
+                
+            if qtype == QTYPE.NS:
+                for ns_rr in records:
+                    ns_name = str(ns_rr.rdata).lower()
+                    # look up a record in our zone file 
+                    glue = self.zone.get((ns_name, QTYPE.A), [])
+                    for glue_rr in glue:
+                        rep.add_ar(glue_rr)
+                
+        self.send(addr, rep)
+
+    def is_authoritive(self, name):
+        n = str(name).lower()
+        if n[-1] != '.':
+            n+='.'
+        return n == self.origin or n.endswith('.' + self.origin)
+            
+        
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Unpack the DNS request
+        
+        try:
+            request = DNSRecord.parse(data)
+            self.log("Received message:\n%s" % request)
+        except:
+            self.log("Received message DIDNT WORK")
+            
+            return
+
+        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
+        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
+        
+        qname = str(request.q.qname).lower()
+        qtype = request.q.qtype
+        
+        if len(request.questions) != 1:
+            reply = request.reply()
+            reply.header.rcode = RCODE.SERVFAIL
+            self.send(addr, reply)
+            return
+        
+        
+        self.log("############ is_authoritive(%s) = %s ############" % (request.q.qname, self.is_authoritive(request.q.qname)))
+        if self.is_authoritive(request.q.qname):
+            self.authoritative_send(request, addr)
+        else:
+            # if no header then server fail 
+            # if not request.header.rd:
+            #     reply = request.reply()
+            #     reply.header.rcode = RCODE.SERVFAIL
+            #     self.send(addr, reply)
+            #     return
+        
+            answers = self.recursive_lookup(qname=qname, qtype=qtype, serverIP=None)
+            reply = request.reply()
+            reply.header.ra = 1
+            reply.header.aa = 0
+            
+            if answers:
+                for rr in answers.rr:
+                    reply.add_answer(rr)
+                
+                # fix by adding ARs too
+                for ar in answers.ar:
+                    reply.add_ar(ar)
+            else:
+                reply.header.rcode = RCODE.SERVFAIL
+            self.send(addr, reply)
+            
+        
+        
+        # response = request.reply()
+        # response.add_answer(RR("abc.com", QTYPE.A, rdata=A("1.2.3.4"), ttl=60))       
+        
+        # self.send(addr, response)
+
+
+    # run the server
+    def run(self):
+        seq = 0
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
