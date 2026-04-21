@@ -13,6 +13,7 @@ class Server:
         self.origin = None
         
         self.zone = {}
+        self.cache = {}
         
         
         self.get_zone_file(domain)
@@ -55,66 +56,162 @@ class Server:
         return DNSRecord.parse(data)
         
         pass
-    
-    def recursive_lookup(self, qname, qtype, serverIP):
+
+    # need to check if the end matches 
+    # ie. *.bailiwick.foo. != *.bailiwick.bar.
+    #     ns.bailiwick.foo. == *.bailiwick.bar.
+    def check_name_and_zone(self, name, zone):
+        name = str(name)
+        zone = str(zone)
+
+        # forces the dot notation
+        if not name.endswith("."):
+            name += "."
+        if not zone.endswith("."):
+            zone += "."
+
+        return name == zone or name.endswith("." + zone)
+
+    def recursive_lookup(self, qname, qtype, serverIP, zone=None):
+        # set the base at root dot .
         if serverIP is None:
             serverIP = self.root_ip
+            zone = '.'
+
+        # check cache
+        if (qname, qtype) in self.cache:
+            # remove expired entries:
+            self.cache[(qname, qtype)] = [(rr, exp_time) for rr, exp_time in self.cache[(qname, qtype)]
+                                          if time.time() < exp_time ]
             
-            
+            # update all the time to lives
+            if self.cache[(qname, qtype)]:
+                for rr, exp_time in self.cache[(qname, qtype)]:
+                    rr.ttl = int(exp_time - time.time())
+                
+                # i have to rebuild the cache
+                holder_record = DNSRecord()
+                holder_record.header.rcode = RCODE.NOERROR
+
+                for rr, exp_time in self.cache[(qname, qtype)]:
+                    holder_record.rr.append(rr)
+                
+                # i have to seperate NS records from glue records - b/c NS is a chain it
+                # will have its own records that also need to be in the cache
+                for rr in holder_record.rr:
+                    if rr.rtype == QTYPE.NS:
+                        nsName = str(rr.rdata).lower()
+
+                        # 
+                        if (nsName, QTYPE.A) in self.cache:
+                            self.cache[(nsName, QTYPE.A)] = [(r_entry, e_time) for r_entry, e_time in self.cache[nsName, QTYPE.A] 
+                                                             if time.time() < e_time]
+                            if self.cache[(nsName, QTYPE.A)]:
+                                for glue_rr, glue_expTime in self.cache[(nsName, QTYPE.A)]:
+                                    glue_rr.ttl = int(glue_expTime - time.time())
+                                    holder_record.ar.append(glue_rr)
+                            else:
+                                del self.cache[(nsName, QTYPE.A)]
+
+                return holder_record
+            else:
+                del self.cache[(qname, qtype)]
+
+
         res = self.send_query_DNS(serverIP, qname, qtype)
         
+        # if there are no records then just return nothing
         if res is None:
             return None
+
+        # bailiwick checking >> we need to check if the name fits in the zone
+
+        # if the base isn't the root then have to check all the answers:
+        if zone != '.':
+            # if the name isn't in the zone then we will throw out the answer
+            res.rr   = [rr for rr in res.rr if self.check_name_and_zone(rr.rname, zone)]
+            res.auth = [rr for rr in res.auth if self.check_name_and_zone(rr.rname, zone)]
+            res.ar   = [rr for rr in res.ar if self.check_name_and_zone(rr.rname, zone)]
         
+
+        # need to be a little more picky when we still have records left:
         if res.rr:
+            aliases_rrs = []
+            if qtype == QTYPE.A:
+                aliases_rrs = [rr for rr in res.rr if (rr.rtype == QTYPE.CNAME and rr.rtype != QTYPE.A)]
+            
+            # if there an alias, recurse and loopup server
+            if aliases_rrs: #and not a_rrs:
+                # We got a alias but no A record — go through the chain
+                alias_name = str(aliases_rrs[-1].rdata)
+                if not alias_name.endswith('.'):
+                    alias_name += '.'
+                
+                # Resolve the CNAME target from scratch (root)
+                last_known_alias = self.recursive_lookup(alias_name, QTYPE.A, None)
+                
+                if last_known_alias and last_known_alias.rr:
+                    # Append the tail results onto our current answer
+                    res.rr = res.rr + last_known_alias.rr
+
+            # add to cache:
+            for rr in res.rr + res.ar:
+                if rr.ttl > 0:
+                    exp_time = time.time() + rr.ttl
+                    
+                    # if the entry doesn't exist create one
+                    if(str(rr.rname).lower(), rr.rtype) not in self.cache:
+                        self.cache[(str(rr.rname).lower(), rr.rtype)] = []
+
+                    self.cache[(str(rr.rname).lower(), rr.rtype)].append((rr, exp_time))
+                    
+            return res
+        
+        # if there's not an error or its authoriative we can still return
+        if res.header.rcode == RCODE.NOERROR and not res.auth:
             return res
 
-        # If we asked for NS records and the auth section has NS records for our qname,
-        # that IS the answer — don't recurse further
+        # If we asked for NS, return a NS record 
         if qtype == QTYPE.NS:
             for authRR in res.auth:
                 if authRR.rtype == QTYPE.NS and str(authRR.rname).lower() == qname.lower():
-                    # Move the NS records from auth into rr (answer) so the caller sees them
-                    res.rr = [rr for rr in res.auth if rr.rtype == QTYPE.NS and str(rr.rname).lower() == qname.lower()]
+                    res.rr = [rr for rr in res.auth
+                            if rr.rtype == QTYPE.NS
+                            and str(rr.rname).lower() == qname.lower()]
                     return res
 
-        for nsRR in res.auth:
-            if nsRR.rtype == QTYPE.NS:
-                name = str(nsRR.rdata)
+        # Follow NS referrals in the authority section 
+        for authAns in res.auth:
+            if authAns.rtype == QTYPE.NS:
+                name = str(authAns.rdata)
                 
+                # need to update the zone when you are following chain of ns records
+                next_zone = str(authAns.rname).lower()
+                if not next_zone.endswith('.'):
+                    next_zone += '.'
+
                 ip = None
                 for ip_sec in res.ar:
                     if name.lower() == str(ip_sec.rname).lower():
-                        ip = str(ip_sec.rdata)
+                        ip = str(ip_sec.rdata) 
                         break
-                
+                    
                 if ip is None:
                     nsRecods = self.recursive_lookup(name,QTYPE.A,None)
                     if nsRecods:
                         ip = str(nsRecods.rr[0].rdata)
-                    
+
                 if ip:
-                    return self.recursive_lookup(qname,qtype,ip)
-        
-        # 
-        # 
-        # answer = self.send_query_DNS(serverIP, qname, qtype)
-        # if self.is_authoritive(answer.q.name):
-        #      self.authoritative_send(answer, serverIP)
-        # else:
-        #     #logic here
-        #     pass
-            
-        # return
+                    # Recurse with the correct bailiwick for the next server
+                    return self.recursive_lookup(qname, qtype, ip, next_zone)
+
+        # self.log("=============== made out here:: %s" % qname)
         return None
-            
-        
         
     def get_zone_file(self, zfile):
         
         with open(zfile) as zf:
             text = zf.read()
-            
         
         for r in RR.fromZone(text):
             name = str(r.rname)
@@ -129,13 +226,11 @@ class Server:
                 self.origin = name
                 self.log("============setting authoritative server ===========:\n=========:: %s ::========" % name)
                     
-            
         return
     
     def authoritative_send(self, request, addr):
         rep = request.reply()
         rep.header.aa = 1
-        
         
         # get the question name from the question section in the packet and get the type
         qname = str(request.q.qname).lower()
@@ -178,7 +273,6 @@ class Server:
             n+='.'
         return n == self.origin or n.endswith('.' + self.origin)
     
-    
     def query_recv(self, request, addr):
         qname = str(request.q.qname).lower()
         qtype = request.q.qtype
@@ -201,27 +295,34 @@ class Server:
             #     reply.header.rcode = RCODE.SERVFAIL
             #     self.send(addr, reply)
             #     return
-        
+
             answers = self.recursive_lookup(qname=qname, qtype=qtype, serverIP=None)
             reply = request.reply()
             reply.header.ra = 1
             reply.header.aa = 0
-            
-            if answers:
+
+            # if there are no answers found just give an errory
+            if answers is None:
+                reply.header.rcode = RCODE.SERVFAIL
+
+            # answer (rr), authority (auth), and additional (ar)
+
+            # if answers exist, send them all 
+            elif answers.rr:
+                # answer
                 for rr in answers.rr:
                     reply.add_answer(rr)
-                
-                # fix by adding ARs too
+                # additional - will contain glue records
                 for ar in answers.ar:
                     reply.add_ar(ar)
-            else:
-                reply.header.rcode = RCODE.SERVFAIL
+
             self.send(addr, reply)
+            
         return
             
         
     def recv(self, socket):
-        data, addr = socket.recvfrom(65535)
+        data, addr = socket.recvfrom(65535) # 65535
 
         # print('\nthreading count ============',str(threading.active_count()))
         self.log('\nthreading count ======  %d   ======' % threading.active_count())
@@ -244,9 +345,6 @@ class Server:
         thread.daemon = True
         thread.start()
 
-        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
-        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
-        
         # qname = str(request.q.qname).lower()
         # qtype = request.q.qtype
         
