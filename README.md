@@ -1,6 +1,7 @@
 # DNS Server
 
 cs4700 project 6
+Authors: Tori Postler, Samuel Steinmetz
 
 zone file
 
